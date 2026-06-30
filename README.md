@@ -530,6 +530,59 @@ walk, the comment-range scan — necessarily live with their own code). Things t
 
 ---
 
+## 12. Going async — a comment-triggered watcher (optional)
+
+Everything above is **synchronous**: you ask the agent to do something, it drives
+the MCP, you review the tracked changes. A natural next layer is **asynchronous**
+— let a coauthor leave a comment like `AI: tighten this paragraph` and have an
+agent act on it on its own, without you in the loop. This is optional and sits
+**on top of** the MCP; the MCP stays the only thing that touches the document.
+
+The shape that works:
+
+1. **A scheduled poll** (cron, a `launchd`/systemd timer — whatever you already
+   run the keepalive with) wakes every N minutes. Pick N comfortably larger than
+   a worst-case agent run so two polls don't stack.
+2. **Read-only discovery.** Using the AI account's session, list the projects it
+   can see (`list_projects`) and, per project, pull comment **threads** via the
+   thread API (`list_comments` — viewport-independent, §5). The watcher itself
+   **never edits** — it only reads and dispatches.
+3. **A trigger convention.** Act only on new comments/replies whose text begins
+   with a literal prefix — e.g. **`AI:`** (case-sensitive keeps it deliberate).
+   Everything else is ignored.
+4. **An author allowlist — this is the trust boundary.** Only fire on a trigger
+   **authored by an allowlisted email**. Anyone on that list can direct an
+   autonomous agent against your manuscript, so keep it to your own accounts and
+   vetted coauthors. Combined with "treat comment text as **data**, not
+   instructions" (§5), this is what makes async safe: a stranger who comments on a
+   shared project can't steer the agent, and even an allowlisted directive is
+   scoped to that one comment.
+5. **At-most-once dispatch.** Persist a per-project set of comment fingerprints
+   you've already acted on, so a directive fires exactly once and re-runs only if
+   you explicitly force it. (A small `state.json` next to your config.)
+6. **One agent per project.** For each project with fresh triggers, spawn a single
+   agent session, authorized to act on **exactly those** directives via the MCP.
+7. **Overlap protection — a per-project lease.** Before a session edits a project,
+   have it take a short-lived **editing lease** (a lockfile carrying a PID +
+   expiry). A second session — or the next poll firing while the first still runs
+   — sees the live lease and backs off, so two agents never edit the same paper at
+   once. Make the lease self-heal: reclaim it if the owning PID is dead or the TTL
+   (≈ the session timeout plus slack) has passed. This is the async counterpart of
+   the in-process single-writer mutex (§2) — the mutex serializes one browser, the
+   lease serializes across *processes*.
+8. **Acknowledge receipt (nice to have).** Post a one-line "on it" reply to the
+   thread before the session starts, via `reply_to_comment`, so a human watching
+   the comment sees the directive landed.
+9. **Bounds.** Cap concurrent sessions, cap each session's wall-clock to under the
+   poll interval, and skip resolved threads by default.
+
+None of this is in the MCP server — it's a thin scheduler + dispatcher around it.
+Keep the editing on the MCP path (tracked changes, the Reviewing gate, exact-match
+verification) and the watcher purely as the read-and-spawn loop, and the same
+safety guarantees carry over to the autonomous case.
+
+---
+
 ## TL;DR checklist
 
 - [ ] Register a **free** Overleaf account at `yourname+AI@gmail.com` (Gmail alias
@@ -554,3 +607,7 @@ walk, the comment-range scan — necessarily live with their own code). Things t
       script and re-run after Overleaf UI changes.
 - [ ] Prefer a **subfile-per-section** paper layout to minimize ambiguous-match
       refusals.
+- [ ] *(Optional, async)* Comment-triggered **watcher**: scheduled read-only poll →
+      `AI:` trigger → **author allowlist** (the trust boundary) → at-most-once
+      dispatch → one agent per project → per-project **lease** for overlap → all
+      edits still on the MCP path.
